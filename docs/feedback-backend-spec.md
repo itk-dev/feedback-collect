@@ -41,7 +41,60 @@ The system consists of two parts:
 
 **Backend application** (new Symfony app) — Receives feedback via API, stores it in a relational database (PostgreSQL), and provides a dashboard with Twig templates, Turbo Drive/Frames, and Stimulus controllers for interactivity.
 
-**Frontend widget changes** (modifications to `itk-dev/tidy-feedback`) — The widget must be configurable to POST feedback to a remote backend URL (rather than the local application) and must include an API key for authentication.
+**Frontend widget changes** (modifications to `itk-dev/tidy-feedback`) — The widget must be configurable to POST feedback to a remote backend URL (rather than the local application) and must include an API key for authentication. *(See section 2.1 — this approach is under review.)*
+
+### 2.1 Open Decision: Data Flow Architecture (Push vs Pull)
+
+> **Status: To be decided.** The architecture diagram above shows a push (POST) model. An alternative pull (fetch/crawl) model has been proposed. This section documents the trade-offs to support the decision.
+
+#### Option A: Push (POST) — widget sends feedback directly to central backend
+
+The spec currently describes this approach. The widget is modified to POST feedback to a remote URL with an API key header. This requires changes to `itk-dev/tidy-feedback` (see section 4).
+
+#### Option B: Pull (Fetch/Crawl) — central backend polls each site
+
+The existing `itk-dev/tidy-feedback` already exposes GET endpoints:
+- `GET /tidy-feedback` — returns all items as JSON (authenticated via basic HTTP auth)
+- `GET /tidy-feedback/{id}` — single item with full data
+- `GET /tidy-feedback/{id}/image` — screenshot as binary
+
+The central backend could periodically call these endpoints on each registered site to collect feedback. This would require **zero widget changes** — section 4 of this spec becomes unnecessary.
+
+#### Trade-off comparison
+
+| Concern | Push (POST to central) | Pull (central polls sites) |
+|---|---|---|
+| **Real-time** | Immediate — feedback visible in dashboard within seconds | Delayed by poll interval (e.g. 5 minutes) |
+| **Widget changes** | Required — ~20 lines of JS + env vars per site | None — widget works as-is |
+| **Bandwidth** | Efficient — each item sent once | Wasteful — full item list (incl. base64 screenshots) fetched every poll cycle. No `since` parameter exists on the GET endpoint. |
+| **Duplicate handling** | Not needed — each POST creates one item | Required — sites use auto-increment integer IDs (not globally unique). Need composite key (site + remote ID) and "last seen" tracking. |
+| **Notifications** | Immediate email on receipt | Delayed by poll interval |
+| **Network topology** | Central backend must be publicly reachable from user browsers | Central backend must be able to reach each site's admin endpoint (may be blocked by firewalls/VPNs) |
+| **Central backend downtime** | Feedback lost unless local fallback added to widget | No impact — sites store locally, backend catches up when restored |
+| **CORS** | Required — must configure allowed origins | Not needed — server-to-server calls |
+| **Scalability** | 1 HTTP request per feedback submission | N sites × polls/hour, each transferring full item lists including screenshots |
+| **Security model** | Hashed API key per project (visible in page source, write-only) | Basic auth credentials for each site stored in central backend |
+| **Existing API changes** | None to existing GET endpoints | Would benefit from adding `since` parameter and pagination to GET endpoint — which means modifying tidy-feedback anyway |
+
+#### Key observations
+
+1. **The existing GET endpoint returns ALL items every poll** — there is no filtering by date or ID. As sites accumulate feedback, each poll transfers increasingly large payloads including base64 screenshot data for every item. Adding a `since` parameter requires modifying tidy-feedback, which eliminates pull's main advantage (zero widget changes).
+
+2. **Pull cannot deliver real-time notifications** — email notifications on new feedback (section 3.10) would be delayed by the poll interval. Push delivers them immediately.
+
+3. **The widget changes for push are small** — approximately 20 lines of JavaScript and a few environment variables per site. The effort is days, not weeks.
+
+4. **Push is the industry standard** for this class of system (Sentry, Hotjar, UserSnap, BugHerd all use POST/push).
+
+5. **Pull has a legitimate advantage for downtime resilience** — if the central backend is offline, feedback continues to be collected locally. However, this can also be addressed in the push model by adding a local storage fallback in the widget (store in localStorage/IndexedDB, retry when backend is available).
+
+#### Recommended approach
+
+Use **push as the primary data flow** (as this spec currently describes), and build a **one-time pull-based migration tool** that uses the existing GET endpoints to import historical feedback from sites into the central backend. This is already partially described in Phase 6, step 22 of the implementation plan.
+
+This gives the best of both approaches: real-time ingestion for new feedback, historical data migration using the existing API, and no ongoing polling overhead.
+
+> **Action needed:** Discuss with the development team and confirm the approach before implementation begins. If pull is chosen, section 4 (Frontend Widget Changes) should be removed and replaced with a polling/sync service specification.
 
 ---
 
@@ -79,16 +132,14 @@ Stores individual feedback submissions. Closely mirrors the existing `Item` mode
 | `subject` | `string(255)` | Feedback subject (required) |
 | `description` | `text, nullable` | User-provided description |
 | `createdBy` | `string(255), nullable` | Email or name of reporter |
-| `status` | `string(32)` | Enum: `new`, `in_progress`, `resolved`, `closed`, `exported` |
-| `category` | `string(64), nullable` | Enum: `bug`, `missing_feature`, `improvement`, `other` |
+| `status` | `string(32)` | Enum: `new`, `in_progress`, `resolved`, `closed` |
+| `category` | `string(64), nullable` | Enum: `bug`, `missing_feature`, `improvement`, `other`. Note: the current widget does not collect category — this is a **dashboard-only classification** assigned by triaging users, not submitted by the widget. |
 | `pageUrl` | `string(2048), nullable` | URL of the page where feedback was given |
 | `contextData` | `json` | Browser info, window size, region, etc. |
 | `screenshotPath` | `string(512), nullable` | Path to stored screenshot file |
 | `htmlDocumentPath` | `string(512), nullable` | Path to stored compressed HTML document (opt-in) |
 | `rawData` | `json` | Full original POST payload for future-proofing |
-| `externalIssueUrl` | `string(2048), nullable` | URL of the created GitHub issue / external tracker issue |
-| `externalIssueId` | `string(255), nullable` | External issue ID/reference (e.g. `owner/repo#42`) |
-| `exportedToTracker` | `ManyToOne → ExternalTrackerConfig, nullable` | Which tracker config was used for export |
+| `exports` | `OneToMany → FeedbackExport` | Export records — see `FeedbackExport` entity below |
 | `createdAt` | `datetime_immutable` | Submission timestamp |
 | `updatedAt` | `datetime_immutable` | Last status change |
 
@@ -103,6 +154,22 @@ Internal notes/comments added by dashboard users to feedback items.
 | `author` | `ManyToOne → User` | User who wrote the note |
 | `content` | `text` | Note content |
 | `createdAt` | `datetime_immutable` | When the note was written |
+
+#### Entity: `FeedbackExport`
+
+Tracks individual exports of feedback items to external issue trackers. A feedback item can be exported to multiple trackers (e.g. GitHub for triage, then Leantime for planning). This replaces the previous design where `externalIssueUrl`/`externalIssueId` were single fields on `FeedbackItem` — that approach treated export as a terminal status (`exported`), but in practice an item can be "resolved" and also exported, or exported to multiple trackers.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `uuid` | Primary key (UUIDv7) |
+| `feedbackItem` | `ManyToOne → FeedbackItem` | The exported feedback item |
+| `trackerConfig` | `ManyToOne → ExternalTrackerConfig` | Which tracker config was used |
+| `externalIssueUrl` | `string(2048)` | URL of the created issue |
+| `externalIssueId` | `string(255)` | External issue ID/reference (e.g. `owner/repo#42`) |
+| `exportedBy` | `ManyToOne → User` | User who performed the export |
+| `createdAt` | `datetime_immutable` | When the export was performed |
+
+This design cleanly separates **workflow status** (`new` → `in_progress` → `resolved` → `closed`) from **export tracking**. A feedback item's status reflects its triage/resolution state, while exports are tracked independently.
 
 #### Entity: `User`
 
@@ -200,12 +267,12 @@ Standard Symfony Security with `form_login`. Users are managed via CLI commands 
 
 **3.4.1 — Overview / Home (`/dashboard`)**
 
-A summary view showing:
+> **Deferred for v1.** The initial home page redirects to the feedback list (`/dashboard/feedback`). A summary overview with statistics becomes meaningful after data accumulates and can be added in a later phase.
+
+Future version would show:
 - Total feedback count per project (with sparkline or simple bar)
 - Recent feedback items across all projects (last 10)
 - Quick-filter buttons for status (new, in_progress, resolved, closed)
-
-This page uses Turbo Frames to load each section independently so the page feels fast.
 
 **3.4.2 — Feedback List (`/dashboard/feedback`)**
 
@@ -213,7 +280,8 @@ The main working view. A filterable, sortable table of all feedback items with b
 
 Filters (rendered as a Stimulus-powered filter bar that updates URL params):
 - **Project** — dropdown/multi-select
-- **Status** — checkbox group (new, in_progress, resolved, closed, exported)
+- **Status** — checkbox group (new, in_progress, resolved, closed)
+- **Exported** — filter by export state (exported / not exported)
 - **Category** — checkbox group
 - **Date range** — from/to date pickers
 - **Search** — free text search on subject, description, created_by
@@ -224,7 +292,8 @@ Pagination: Standard Symfony paginator with Turbo Frame so only the table body r
 
 Bulk actions (applied to selected items via checkboxes):
 - **Change status** — Set status on multiple items at once
-- **Export to issue tracker** — Create issues in the project's configured tracker for all selected items (see section 3.8)
+
+> **Deferred:** Bulk export to issue tracker is deferred to a later phase. Single-item export from the feedback detail page (section 3.9.2) covers the initial need. Bulk export adds significant UI complexity (cross-project tracker selection, progress tracking, partial failure handling) that is not justified until the single-export workflow is proven.
 
 Implementation approach: Use a `LiveComponent` (Symfony UX) for the filter + table combination. The `LiveProp(writable: true, url: true)` feature maps filter state to URL query parameters, making filters bookmarkable and shareable. As the user changes filters, the component re-renders server-side and Turbo morphs the DOM.
 
@@ -236,8 +305,8 @@ Shows full details of a single feedback item:
 - Context data (collapsible JSON display)
 - Page URL (clickable link)
 - Status change controls (dropdown to update status, with Stimulus confirmation)
-- External issue link (if exported) — clickable link to the created GitHub/tracker issue
-- "Export to issue tracker" button with tracker selection (if the project has trackers configured and item not yet exported)
+- Export history — list of `FeedbackExport` records with clickable links to created issues
+- "Export to issue tracker" button with tracker selection (if the project has trackers configured)
 - Internal notes section (add/view notes from dashboard users)
 
 Status changes are handled via a small Stimulus controller that submits a PATCH request and updates the badge via Turbo Stream.
@@ -257,7 +326,7 @@ Symfony Form for:
 - Active/inactive toggle
 - HTML document capture toggle
 - Notification email addresses (comma-separated or tag-style input)
-- External issue tracker configurations — an embedded collection allowing add/edit/remove of multiple tracker connections (see section 3.8)
+- External issue tracker configurations — an embedded collection allowing add/edit/remove of multiple tracker connections (see section 3.9)
 
 On **create**, the system generates a new API key and displays it **once** in a dismissable alert (the key is hashed and cannot be retrieved later). A "Regenerate API key" button is available on the edit page.
 
@@ -291,7 +360,7 @@ TIDY_FEEDBACK_CAPTURE_DOCUMENT=false
 | API auth | Custom API key authenticator (Symfony Security) |
 | Screenshot storage | Local filesystem (Flysystem abstraction for future S3 support) |
 | Email notifications | Symfony Mailer |
-| External trackers | GitHub API via `knplabs/github-api`, Leantime API, adapter pattern for others |
+| External trackers | GitHub API via `knplabs/github-api` (v1), adapter pattern for future trackers |
 | Testing | PHPUnit + Symfony Panther for E2E |
 | Dev tooling | Docker Compose, Taskfile |
 
@@ -323,11 +392,38 @@ CORS must be configured to accept requests from all registered project URLs. Thi
 - The `document` HTML in context is stored compressed but never rendered raw in the dashboard (XSS prevention)
 - External tracker tokens are encrypted at rest (Symfony Secrets or `paragonie/halite`)
 
-### 3.8 External Issue Tracker Integration
+### 3.8 Data Integrity & Operational Concerns
 
-This feature allows dashboard users to export feedback items — individually or in bulk — as issues in GitHub, GitLab, or Jira.
+#### 3.8.1 Database Indexing Strategy
 
-#### 3.8.1 Configuration
+The feedback list page supports filtering by project, status, date range, and free-text search. The following indexes are required on `FeedbackItem`:
+
+- `project_id` — filter by project
+- `status` — filter by workflow status
+- `createdAt` — sort by date, date range filter
+- `project_id, status, createdAt` — composite index for the most common query pattern (filtered list sorted by date)
+- GIN index on `subject` and `description` — PostgreSQL full-text search for the search filter
+
+#### 3.8.2 Data Retention & Cleanup
+
+- **Screenshot cleanup:** A scheduled job (Symfony Scheduler or cron) should remove screenshot and HTML document files for feedback items older than a configurable retention period (default: 12 months). The `FeedbackItem` record is preserved but the file paths are set to null.
+- **Project archival:** When a project is deactivated (`isActive = false`), it stops accepting new feedback but existing items remain accessible. There is no hard delete of projects — use deactivation instead.
+- **Cascading behavior:** If a project must be deleted (rare), all associated `FeedbackItem`, `FeedbackExport`, `FeedbackNote`, and `ExternalTrackerConfig` records are cascade-deleted.
+
+#### 3.8.3 Error Resilience
+
+- **Screenshot storage failure:** If screenshot extraction or file storage fails (disk full, permission error, corrupt base64), the API should still accept and store the feedback item. The `screenshotPath` field is set to null and the failure is logged. The user's feedback should never be lost due to a screenshot processing error.
+- **HTML document storage failure:** Same approach — store the feedback item, set `htmlDocumentPath` to null, log the error.
+
+#### 3.8.4 Timezone Handling
+
+All timestamps are stored in UTC in the database (matching the existing `itk-dev/tidy-feedback` behavior). The dashboard displays timestamps in the user's local timezone using browser-based formatting (e.g. `Intl.DateTimeFormat` via a small Stimulus controller or Twig's `timezone` filter with a user preference).
+
+### 3.9 External Issue Tracker Integration
+
+This feature allows dashboard users to export feedback items as issues in external trackers. **For v1, only the GitHub adapter will be implemented.** GitLab, Jira, and Leantime adapters are defined in the interface but deferred to later phases.
+
+#### 3.9.1 Configuration
 
 Each project can have **one or more** `ExternalTrackerConfig` entries (see data model). These are managed on the project edit page, where the user can add, edit, and remove tracker connections. Each tracker has its own type, repository target, API token, default labels, and an optional issue body template.
 
@@ -356,31 +452,29 @@ The issue body template uses Twig-like placeholders so the team can customize wh
 
 A default template is used when no custom template is configured.
 
-#### 3.8.2 Single Export (from Feedback Detail)
+#### 3.9.2 Single Export (from Feedback Detail)
 
-On the feedback detail page, an "Export to issue tracker" button appears when:
-- The project has at least one active `ExternalTrackerConfig`
-- The item has not already been exported (no `externalIssueUrl` set)
+On the feedback detail page, an "Export to issue tracker" button appears when the project has at least one active `ExternalTrackerConfig`.
 
 If the project has **multiple trackers configured**, clicking the button shows a dropdown or modal letting the user choose which tracker to export to (e.g. "GitHub – itk-dev/my-site" or "Leantime – Redesign project"). If only one tracker is configured, it exports directly.
 
-After export, the resulting issue URL and reference are stored on the `FeedbackItem`. The item's status is updated to `exported`. A link to the created issue is displayed.
+After export, a `FeedbackExport` record is created linking the feedback item to the tracker and storing the issue URL and reference. A link to the created issue is displayed in the export history section on the detail page.
 
-If the item has already been exported, the button is replaced with a link to the existing issue.
+An item can be exported to **multiple trackers** (e.g. first to GitHub for triage, then to Leantime for planning). Each export creates a separate `FeedbackExport` record. The item's workflow status (`new`, `in_progress`, `resolved`, `closed`) is independent of its export state.
 
-#### 3.8.3 Bulk Export (from Feedback List)
+#### 3.9.3 Bulk Export (from Feedback List) — Deferred
 
-On the feedback list page, users can select multiple items via checkboxes and use the "Export to issue tracker" bulk action. This:
+> **Deferred to a later phase.** Single-item export from the feedback detail page covers the initial need. Bulk export is specified here for future reference.
 
-1. Shows a confirmation dialog where the user **selects which tracker** to export to (from the trackers configured on the relevant projects). If selected items span multiple projects, only trackers from projects that have them configured are shown — items without a matching tracker are flagged.
-2. Creates one issue per feedback item (not a single combined issue) — each gets its own issue in the tracker
-3. Processes exports sequentially with progress feedback (Turbo Stream updates or a simple progress indicator via Stimulus)
-4. Updates each item's `externalIssueUrl`, `externalIssueId`, and status
-5. Shows a summary when done: how many succeeded, any failures (e.g. rate limit, auth error)
+When implemented, bulk export would:
 
-Items that have already been exported are skipped (with a note in the summary).
+1. Show a confirmation dialog where the user **selects which tracker** to export to (from the trackers configured on the relevant projects). If selected items span multiple projects, only trackers from projects that have them configured are shown — items without a matching tracker are flagged.
+2. Create one issue per feedback item (not a single combined issue) — each gets its own issue in the tracker
+3. Process exports sequentially with progress feedback (Turbo Stream updates or a simple progress indicator via Stimulus)
+4. Create a `FeedbackExport` record for each successful export
+5. Show a summary when done: how many succeeded, any failures (e.g. rate limit, auth error)
 
-#### 3.8.4 Implementation: Adapter Pattern
+#### 3.9.4 Implementation: Adapter Pattern
 
 The integration uses a service interface (`ExternalTrackerInterface`) with concrete implementations for each tracker type:
 
@@ -396,18 +490,16 @@ interface ExternalTrackerInterface
 `ExternalIssueResult` is a simple value object containing `issueUrl`, `issueId`, and `success`.
 
 Concrete adapters:
-- `GitHubTrackerAdapter` — Uses `knplabs/github-api` or direct HTTP client to call GitHub REST API v3. Creates issue with title from subject, body from template, and applies default labels.
-- `GitLabTrackerAdapter` — Uses GitLab REST API. Similar to GitHub.
-- `JiraTrackerAdapter` — Uses Jira REST API. Maps feedback to Jira issue fields.
-- `LeantimeTrackerAdapter` — Uses Leantime REST API to create tickets. Maps category to Leantime ticket types.
+- `GitHubTrackerAdapter` **(v1)** — Uses `knplabs/github-api` or direct HTTP client to call GitHub REST API v3. Creates issue with title from subject, body from template, and applies default labels.
+- `LeantimeTrackerAdapter` *(future)* — Uses Leantime REST API to create tickets. Prioritized after GitHub given team usage.
+- `GitLabTrackerAdapter` *(future)* — Uses GitLab REST API. Similar to GitHub.
+- `JiraTrackerAdapter` *(future)* — Uses Jira REST API. Maps feedback to Jira issue fields.
 
-Starting with GitHub as the first implementation is recommended, since the team already uses it. Leantime, GitLab, and Jira adapters can follow.
-
-#### 3.8.5 Screenshot Attachment
+#### 3.9.5 Screenshot Attachment
 
 When exporting to GitHub, the screenshot can optionally be uploaded as an image in the issue body (GitHub supports inline images via their upload API or by embedding base64 in the markdown — though the latter has size limits). A pragmatic approach: include a link back to the screenshot in the feedback backend dashboard rather than uploading the image, to avoid complexity with different tracker upload APIs.
 
-### 3.9 Notifications
+### 3.10 Notifications
 
 When new feedback is submitted, the backend sends email notifications to the addresses configured on the project (`notificationEmails` field). Notifications are sent asynchronously via Symfony Messenger to avoid slowing down the API response.
 
@@ -545,7 +637,7 @@ The API key will be visible in the page source (embedded in the widget config). 
    - Configure AssetMapper + Stimulus + Turbo
 
 2. **Data model & migrations**
-   - Create `Project`, `FeedbackItem`, `FeedbackNote`, `User`, `ExternalTrackerConfig` entities with Doctrine ORM
+   - Create `Project`, `FeedbackItem`, `FeedbackNote`, `FeedbackExport`, `User`, `ExternalTrackerConfig` entities with Doctrine ORM
    - Generate and run migrations
    - Add fixtures for development
 
@@ -635,7 +727,7 @@ The API key will be visible in the page source (embedded in the widget config). 
 
 ### Phase 5: External Issue Tracker Integration
 
-**Goal:** Export feedback to GitHub (and later GitLab/Jira) as issues.
+**Goal:** Export feedback to GitHub as issues.
 
 15. **Tracker configuration**
     - `ExternalTrackerConfig` entity and embedded collection form on project edit page
@@ -645,57 +737,50 @@ The API key will be visible in the page source (embedded in the widget config). 
     - Issue body template editor with placeholder reference
 
 16. **GitHub adapter**
-    - Implement `GitHubTrackerAdapter` (first adapter)
+    - Implement `GitHubTrackerAdapter` (first and only v1 adapter)
     - Create issue via GitHub REST API with title, body from template, labels
     - Screenshot link in issue body (link back to dashboard)
-    - Store `externalIssueUrl` and `externalIssueId` on feedback item
+    - Create `FeedbackExport` record linking item to tracker and issue
 
 17. **Single export**
     - "Export to issue tracker" button on feedback detail page
     - Tracker selection dropdown when project has multiple trackers
-    - Creates issue, updates item status to `exported`, displays link
-    - Disabled/replaced with link when already exported
+    - Creates issue, creates `FeedbackExport` record, displays link
+    - Export history section on detail page showing all exports for the item
 
-18. **Bulk export**
-    - Bulk action on feedback list: "Export to issue tracker"
-    - Confirmation dialog with tracker selection, item count, and target
-    - Sequential processing with progress updates
-    - Summary of successes / failures
-    - Skip already-exported items
-
-19. **Additional adapters**
-    - `LeantimeTrackerAdapter`
-    - `GitLabTrackerAdapter`
-    - `JiraTrackerAdapter`
+> **Deferred to later phases:**
+> - **Bulk export** — see section 3.9.3
+> - **Additional adapters** — `LeantimeTrackerAdapter`, `GitLabTrackerAdapter`, `JiraTrackerAdapter`
 
 ### Phase 6: Polish & Production Readiness
 
 **Goal:** Production-ready application.
 
-20. **Dashboard overview page**
-    - Summary statistics per project
-    - Recent feedback list (Turbo Frame, lazy-loaded)
-
-21. **Export & reports**
-    - CSV export of filtered feedback
-
-22. **Data migration tool**
+18. **Data migration tool**
     - CLI command to import existing local tidy-feedback data into the central backend
-    - Reads from the existing SQLite database format
+    - Uses the existing `GET /tidy-feedback` API on each site (with basic auth) to fetch historical items — leveraging the existing API rather than reading SQLite files directly
     - Maps old `Item` entities to new `FeedbackItem` entities
-    - Associates with a specified project
+    - Extracts screenshots from the `data` JSON blob and stores them on the filesystem
+    - Associates imported items with a specified project
+    - Tracks imported item IDs to avoid duplicates on re-run
 
-23. **Operational concerns**
+19. **Operational concerns**
     - Health check endpoint (`/api/health`)
     - Logging and monitoring hooks
     - Backup strategy documentation
     - Deployment documentation (Docker / platform.sh / similar)
-    - Screenshot cleanup job (Symfony Scheduler or cron)
+    - Screenshot cleanup job (Symfony Scheduler or cron) per retention policy (section 3.8.2)
 
-24. **Testing**
+20. **Testing**
     - Unit tests for API key auth, feedback ingestion, tracker adapters
     - Functional tests for dashboard (WebTestCase)
-    - E2E tests with Panther for Live Components
+    - E2E tests with Panther for critical flows
+
+> **Deferred to future phases:**
+> - **Dashboard overview page** — summary statistics per project, sparklines, recent feedback
+> - **CSV export** — export of filtered feedback for offline analysis
+> - **Bulk export** — export multiple feedback items to issue trackers at once
+> - **Additional tracker adapters** — Leantime, GitLab, Jira
 
 ---
 
@@ -709,7 +794,6 @@ tidy-feedback-backend/
 │   │   ├── confirm_controller.js
 │   │   ├── filter_controller.js
 │   │   ├── bulk_select_controller.js
-│   │   ├── export_progress_controller.js
 │   │   └── collapsible_controller.js
 │   ├── styles/
 │   │   └── app.css
@@ -740,6 +824,7 @@ tidy-feedback-backend/
 │   │   ├── Project.php
 │   │   ├── FeedbackItem.php
 │   │   ├── FeedbackNote.php
+│   │   ├── FeedbackExport.php
 │   │   ├── ExternalTrackerConfig.php
 │   │   └── User.php
 │   ├── Twig/Components/       # Live Components
@@ -757,10 +842,7 @@ tidy-feedback-backend/
 │   │   ├── ExternalIssueResult.php
 │   │   ├── ExternalTrackerRegistry.php
 │   │   ├── Adapter/
-│   │   │   ├── GitHubTrackerAdapter.php
-│   │   │   ├── GitLabTrackerAdapter.php
-│   │   │   ├── JiraTrackerAdapter.php
-│   │   │   └── LeantimeTrackerAdapter.php
+│   │   │   └── GitHubTrackerAdapter.php  # v1 — other adapters added later
 │   │   └── IssueBodyRenderer.php
 │   ├── Message/               # Messenger messages
 │   │   ├── SendFeedbackNotification.php
@@ -814,9 +896,11 @@ tidy-feedback-backend/
 
 **Adapter pattern for issue trackers** — Cleanly separates tracker-specific API logic from the core application. Adding a new tracker is one new class implementing the interface. Starting with GitHub since the team already uses it. Leantime is prioritized next given team usage.
 
-**Multiple trackers per project with per-item selection** — A project might use GitHub for code bugs and Leantime for product planning. Rather than forcing a single tracker, the dashboard lets users choose where to export each feedback item (or batch). This adds minor UI complexity but provides significant workflow flexibility.
+**Multiple trackers per project with per-item selection** — A project might use GitHub for code bugs and Leantime for product planning. Rather than forcing a single tracker, the dashboard lets users choose where to export each feedback item. This adds minor UI complexity but provides significant workflow flexibility.
 
-**One issue per feedback item (not combined)** — Bulk export creates individual issues rather than a single combined issue. Each feedback item maps to a distinct problem and should be trackable independently in the issue tracker.
+**Export tracking separate from workflow status** — Export state is tracked via `FeedbackExport` records (OneToMany from FeedbackItem) rather than as a status enum value. This allows an item to be "resolved" and also exported, or exported to multiple trackers. The workflow status (`new` → `in_progress` → `resolved` → `closed`) reflects triage/resolution, not export state.
+
+**One issue per feedback item (not combined)** — Each feedback item maps to a distinct problem and should be trackable independently in the issue tracker.
 
 **Link-back for screenshots (not upload)** — When exporting to issue trackers, the issue body contains a link back to the screenshot in the feedback backend dashboard rather than uploading the image to the tracker. This avoids dealing with different upload APIs across trackers and keeps the screenshot hosted in one place.
 
@@ -838,24 +922,42 @@ This would require:
 
 This is a significant feature that would likely warrant its own specification, but the current data model and API key authentication already provide the foundation.
 
-### 8.2 Per-item Tracker Selection at Feedback Detail Level
-
-The current design allows choosing a tracker at export time. A future enhancement could allow **re-exporting** the same feedback item to a different tracker (e.g. first sent to GitHub for triage, then also to Leantime for planning). This would change `externalIssueUrl`/`externalIssueId` from single fields to a `OneToMany` collection of export records.
-
-### 8.3 Webhook / Slack Notifications
+### 8.2 Webhook / Slack Notifications
 
 Extend the notification system beyond email to support webhooks (generic HTTP POST) and Slack integration. This would use the same async Messenger approach, with configurable notification channels per project.
 
-### 8.4 Feedback Status Sync from Issue Trackers
+### 8.3 Feedback Status Sync from Issue Trackers
 
 When an issue is closed in GitHub or resolved in Leantime, automatically update the corresponding feedback item's status in the backend. This could be implemented via:
 - Webhook receivers for each tracker type (GitHub webhooks, Leantime webhooks)
 - Or periodic polling of exported issues to check for status changes
 
-### 8.5 Dashboard User Scoping
+### 8.4 Dashboard User Scoping
 
 Add project-level access control so specific users only see feedback from their assigned projects. Useful when the backend serves multiple teams or organizations.
 
-### 8.6 Public Feedback Status Page
+### 8.5 Public Feedback Status Page
 
 An optional, unauthenticated page per project showing submitted feedback and its current status — so end-users who submitted feedback can see that their report is being addressed. This would require a separate "public token" per feedback item (sent in the confirmation response) to avoid exposing the full list.
+
+### 8.6 Bulk Export to Issue Trackers
+
+Bulk export of multiple feedback items at once from the feedback list page. See section 3.9.3 for the full specification. Deferred from v1 due to UI complexity.
+
+### 8.7 Dashboard Overview with Statistics
+
+Summary overview page with feedback counts per project, sparklines/charts, recent feedback, and quick-filter buttons. Deferred from v1 — the home page redirects to the feedback list until there is enough data to make statistics meaningful.
+
+### 8.8 CSV Export
+
+Export filtered feedback as CSV for offline analysis or reporting. Deferred from v1.
+
+### 8.9 Additional Tracker Adapters
+
+- `LeantimeTrackerAdapter` — prioritized after GitHub given team usage
+- `GitLabTrackerAdapter`
+- `JiraTrackerAdapter`
+
+### 8.10 Notification Throttling
+
+When a site submits many feedback items in a burst, the configured notification emails should receive a digest rather than individual emails per item. Could use Symfony Messenger's delay/batch capabilities.
