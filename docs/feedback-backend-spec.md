@@ -2,46 +2,60 @@
 
 ## 1. Problem Statement
 
-The existing `itk-dev/tidy-feedback` package is a combined Drupal module / Symfony bundle that collects user feedback on a single site. Feedback is stored in a local SQLite (or other) database alongside the application itself. There is no multi-site support, no central dashboard, and no way to manage which sites feed into the system.
+The existing `itk-dev/tidy-feedback` package is a combined Drupal module / Symfony bundle that collects user feedback. It is installed on **staging sites only** (not production). It provides a floating feedback widget and a local dashboard at `/tidy-feedback` where testers and the Product Owner can review their own submissions, verify screenshots, and confirm context data was recorded correctly. Feedback is stored in a local SQLite database on the staging site itself.
 
-**Goal:** Build a dedicated Symfony backend application that acts as a centralized feedback collector for multiple sites/projects, each running the tidy-feedback widget. Provide a management dashboard for viewing, filtering, and managing feedback across all connected sites — with the ability to forward feedback as issues to GitHub or other project management tools.
+There is no multi-site support, no central dashboard for project managers, and no way to aggregate or triage feedback across multiple sites or projects.
+
+**Goal:** Build a dedicated Symfony backend application that acts as a centralized feedback collector for multiple staging sites/projects, each running the tidy-feedback widget. Provide a management dashboard for the Product Manager to view, filter, triage, and export feedback across all connected sites — with the ability to forward feedback as issues to GitHub or other project management tools.
+
+The local tidy-feedback dashboard on each staging site remains the **testers' and PO's primary interface**. The central backend is the **PM's interface** for triage and routing.
 
 ---
 
 ## 2. Architecture Overview
 
 ```
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  Site A       │  │  Site B       │  │  Site C       │
-│  (Drupal)     │  │  (Symfony)    │  │  (Any CMS)    │
-│  tidy-feedback│  │  tidy-feedback│  │  tidy-feedback│
-│  widget       │  │  widget       │  │  widget       │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │                 │                 │
-       │  POST /api/feedback              │
-       │  + API key header                │
-       └────────────┬────┘─────────────────┘
-                    ▼
-        ┌───────────────────────┐
-        │  Tidy Feedback Backend │
-        │  (Symfony application) │
-        │                       │
-        │  • REST API ingestion │
-        │  • Dashboard (Twig +  │
-        │    Stimulus/Turbo)    │
-        │  • Site/project mgmt  │
-        │  • User auth (login)  │
-        │  • Notifications      │
-        │  • Export to GitHub /  │
-        │    issue trackers     │
-        └───────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Staging environments (one per project)                   │
+│                                                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │  Site A       │  │  Site B       │  │  Site C       │  │
+│  │  (Drupal)     │  │  (Symfony)    │  │  (Any CMS)    │  │
+│  │  tidy-feedback│  │  tidy-feedback│  │  tidy-feedback│  │
+│  │  widget +     │  │  widget +     │  │  widget +     │  │
+│  │  local SQLite │  │  local SQLite │  │  local SQLite │  │
+│  │  dashboard    │  │  dashboard    │  │  dashboard    │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
+│  ▲ PO/tester interface    │                 │            │
+└──┼──────────────────────  │  ───────────────┼────────────┘
+   │                        │                 │
+   │  feedback forwarded to central backend   │
+   │  (push POST, pull, or both — TBD)        │
+   └────────────┬───────────┘─────────────────┘
+                ▼
+    ┌───────────────────────┐
+    │  Tidy Feedback Backend │
+    │  (Symfony application) │
+    │                       │
+    │  • REST API ingestion │
+    │  • Dashboard (Twig +  │
+    │    Stimulus/Turbo)    │
+    │  • Site/project mgmt  │
+    │  • User auth (login)  │
+    │  • Notifications      │
+    │  • Export to GitHub /  │
+    │    issue trackers     │
+    └───────────────────────┘
+    ▲ PM interface
 ```
 
-The system consists of two parts:
+The system consists of two distinct layers:
 
-**Backend application** (new Symfony app) — Receives feedback via API, stores it in a relational database (PostgreSQL), and provides a dashboard with Twig templates, Turbo Drive/Frames, and Stimulus controllers for interactivity.
+**Staging site layer** (`itk-dev/tidy-feedback` module/bundle) — Installed on each staging site. Provides the feedback widget for testers and POs, stores submissions in a local SQLite database, and exposes a local dashboard at `/tidy-feedback` for reviewing submissions. This is the primary interface for the people submitting feedback.
 
-**Frontend widget changes** (modifications to `itk-dev/tidy-feedback`) — The widget must be configurable to POST feedback to a remote backend URL (rather than the local application) and must include an API key for authentication. *(See section 2.1 — this approach is under review.)*
+**Central backend application** (new Symfony app) — Aggregates feedback from all staging sites, stores it in PostgreSQL, and provides a dashboard for the Product Manager to triage, categorise, and export items to GitHub. This is the PM's domain — not the tester's.
+
+How feedback moves from the staging layer to the central backend is an open architectural decision (see section 2.1).
 
 ### 2.1 Open Decision: Data Flow Architecture (Push vs Pull)
 
@@ -60,21 +74,28 @@ The existing `itk-dev/tidy-feedback` already exposes GET endpoints:
 
 The central backend could periodically call these endpoints on each registered site to collect feedback. This would require **zero widget changes** — section 4 of this spec becomes unnecessary.
 
+#### Option C: Dual — widget posts locally AND to central backend (graceful degradation)
+
+A hybrid of Options A and B. The widget always POSTs to the local endpoint first (guaranteed local storage), and also forwards the submission to the central backend if configured. If the central backend is unreachable, the widget still confirms success to the tester based on the local write — the central backend sync is best-effort. This requires the same widget changes as Option A but eliminates the "feedback lost on backend downtime" risk.
+
+The local tidy-feedback dashboard continues to work as the tester's primary review tool regardless of backend availability. Historical items can be imported into the central backend via the pull-based migration tool (Phase 6) if needed.
+
 #### Trade-off comparison
 
-| Concern | Push (POST to central) | Pull (central polls sites) |
-|---|---|---|
-| **Real-time** | Immediate — feedback visible in dashboard within seconds | Delayed by poll interval (e.g. 5 minutes) |
-| **Widget changes** | Required — ~20 lines of JS + env vars per site | None — widget works as-is |
-| **Bandwidth** | Efficient — each item sent once | Wasteful — full item list (incl. base64 screenshots) fetched every poll cycle. No `since` parameter exists on the GET endpoint. |
-| **Duplicate handling** | Not needed — each POST creates one item | Required — sites use auto-increment integer IDs (not globally unique). Need composite key (site + remote ID) and "last seen" tracking. |
-| **Notifications** | Immediate email on receipt | Delayed by poll interval |
-| **Network topology** | Central backend must be publicly reachable from user browsers | Central backend must be able to reach each site's admin endpoint (may be blocked by firewalls/VPNs) |
-| **Central backend downtime** | Feedback lost unless local fallback added to widget | No impact — sites store locally, backend catches up when restored |
-| **CORS** | Required — must configure allowed origins | Not needed — server-to-server calls |
-| **Scalability** | 1 HTTP request per feedback submission | N sites × polls/hour, each transferring full item lists including screenshots |
-| **Security model** | Hashed API key per project (visible in page source, write-only) | Basic auth credentials for each site stored in central backend |
-| **Existing API changes** | None to existing GET endpoints | Would benefit from adding `since` parameter and pagination to GET endpoint — which means modifying tidy-feedback anyway |
+| Concern | Push (POST to central) | Pull (central polls sites) | Dual (local + central, best-effort) |
+|---|---|---|---|
+| **Real-time** | Immediate — feedback visible in dashboard within seconds | Delayed by poll interval (e.g. 5 minutes) | Immediate for central backend; local write always immediate |
+| **Widget changes** | Required — ~20 lines of JS + env vars per site | None — widget works as-is | Same as push — ~20 lines of JS + env vars |
+| **Bandwidth** | Efficient — each item sent once | Wasteful — full item list (incl. base64 screenshots) fetched every poll cycle. No `since` parameter exists on the GET endpoint. | Same as push — one POST per item to central backend |
+| **Duplicate handling** | Not needed — each POST creates one item | Required — sites use auto-increment integer IDs (not globally unique). Need composite key (site + remote ID) and "last seen" tracking. | Not needed for new submissions; needed for migration of historical items only |
+| **Notifications** | Immediate email on receipt | Delayed by poll interval | Immediate on receipt |
+| **Network topology** | Central backend must be publicly reachable from user browsers | Central backend must be able to reach each site's admin endpoint (may be blocked by firewalls/VPNs) | Same as push — backend must be publicly reachable |
+| **Central backend downtime** | Feedback lost unless local fallback added to widget | No impact — sites store locally, backend catches up when restored | **No impact** — local write always succeeds; central backend sync retried or imported later |
+| **CORS** | Required — must configure allowed origins | Not needed — server-to-server calls | Required — same as push |
+| **Scalability** | 1 HTTP request per feedback submission | N sites × polls/hour, each transferring full item lists including screenshots | 1 local write + 1 remote POST per submission |
+| **Security model** | Hashed API key per project (visible in page source, write-only) | Basic auth credentials for each site stored in central backend | Same as push |
+| **Existing API changes** | None to existing GET endpoints | Would benefit from adding `since` parameter and pagination to GET endpoint — which means modifying tidy-feedback anyway | None to existing GET endpoints |
+| **Tester experience on backend downtime** | Error shown, or feedback silently lost | No visible impact | Success shown (local write succeeded); backend sync is invisible |
 
 #### Key observations
 
@@ -86,15 +107,17 @@ The central backend could periodically call these endpoints on each registered s
 
 4. **Push is the industry standard** for this class of system (Sentry, Hotjar, UserSnap, BugHerd all use POST/push).
 
-5. **Pull has a legitimate advantage for downtime resilience** — if the central backend is offline, feedback continues to be collected locally. However, this can also be addressed in the push model by adding a local storage fallback in the widget (store in localStorage/IndexedDB, retry when backend is available).
+5. **The local dashboard is the tester's primary interface** — testers and the PO review submissions locally at `/tidy-feedback` on the staging site, not in the central backend. This means the central backend is not in the critical path for the tester experience. If the central backend is unreachable, the tester's workflow is unaffected as long as the local write succeeds.
+
+6. **Dual (Option C) gives the best tester experience** — the local write always succeeds and confirms the submission immediately. The central backend sync is invisible to the tester, making backend downtime a PM concern rather than a tester-facing failure.
 
 #### Recommended approach
 
-Use **push as the primary data flow** (as this spec currently describes), and build a **one-time pull-based migration tool** that uses the existing GET endpoints to import historical feedback from sites into the central backend. This is already partially described in Phase 6, step 22 of the implementation plan.
+Use **dual posting (Option C) as the primary data flow**: the widget always POSTs to the local endpoint first, then forwards to the central backend as a best-effort fire-and-forget. The tester sees success based on the local write. The central backend receives real-time submissions when available.
 
-This gives the best of both approaches: real-time ingestion for new feedback, historical data migration using the existing API, and no ongoing polling overhead.
+Combine this with a **one-time pull-based migration tool** (Phase 6, step 22) using the existing GET endpoints to import any historical items that were collected before the central backend was set up.
 
-> **Action needed:** Discuss with the development team and confirm the approach before implementation begins. If pull is chosen, section 4 (Frontend Widget Changes) should be removed and replaced with a polling/sync service specification.
+> **Action needed:** Discuss with the development team and confirm the approach before implementation begins. If pure pull is chosen, section 4 (Frontend Widget Changes) should be removed and replaced with a polling/sync service specification.
 
 ---
 
