@@ -1,0 +1,175 @@
+version: "3"
+
+dotenv: [".env.local", ".env"]
+
+vars:
+  BASE_URL: '{{.TASK_BASE_URL | default .COMPOSE_SERVER_DOMAIN | default .COMPOSE_DOMAIN | default "https://feedback-collect.local.itkdev.dk"}}'
+  DOCKER_COMPOSE: '{{.TASK_DOCKER_COMPOSE | default "docker compose"}}'
+  DOCKER_COMPOSE_PROFILES: '{{.TASK_DOCKER_COMPOSE_PROFILES | default ""}}'
+  COMPOSER_INSTALL_ARGUMENTS: '{{.TASK_COMPOSER_INSTALL_ARGUMENTS | default ""}}'
+
+tasks:
+  default:
+    cmds:
+      - task --list-all
+    silent: true
+
+  # ---------------------------------------------------------------------------
+  # Docker Compose
+  # ---------------------------------------------------------------------------
+
+  compose:
+    cmds:
+      - '{{.DOCKER_COMPOSE}} {{if .DOCKER_COMPOSE_PROFILES}}--profile {{.DOCKER_COMPOSE_PROFILES | splitList "," | join " --profile " }}{{end}} {{.CLI_ARGS}}'
+    vars:
+      DOCKER_COMPOSE_PROFILES: "{{.PROFILES | default .DOCKER_COMPOSE_PROFILES}}"
+
+  compose-up:
+    cmds:
+      - task compose -- up --detach --remove-orphans {{if .COMPOSE_UP_WAIT}}--wait{{end}}
+    silent: true
+
+  # ---------------------------------------------------------------------------
+  # Composer
+  # ---------------------------------------------------------------------------
+
+  composer:
+    cmds:
+      - task compose -- exec phpfpm composer {{.CLI_ARGS}}
+    silent: true
+
+  composer-install:
+    cmds:
+      - task composer -- install {{.COMPOSER_INSTALL_ARGUMENTS}} {{.CLI_ARGS}}
+    silent: true
+
+  # ---------------------------------------------------------------------------
+  # Symfony Console
+  # ---------------------------------------------------------------------------
+
+  console:
+    cmds:
+      - task compose -- exec phpfpm bin/console {{.CLI_ARGS}}
+    silent: true
+
+  # ---------------------------------------------------------------------------
+  # Coding Standards
+  # ---------------------------------------------------------------------------
+
+  coding-standards:apply:
+    desc: "Apply coding standards"
+    cmds:
+      - task: coding-standards:javascript:apply
+      - task: coding-standards:markdown:apply
+      - task: coding-standards:php:apply
+      - task: coding-standards:styles:apply
+      - task: coding-standards:twig:apply
+      - task: coding-standards:yaml:apply
+    silent: true
+
+  coding-standards:check:
+    desc: "Check coding standards"
+    cmds:
+      - task: coding-standards:javascript:check
+      - task: coding-standards:markdown:check
+      - task: coding-standards:php:check
+      - task: coding-standards:styles:check
+      - task: coding-standards:twig:check
+      - task: coding-standards:yaml:check
+    silent: true
+
+  # PHP
+  coding-standards:php:apply:
+    desc: "Apply coding standards for PHP"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm phpfpm vendor/bin/php-cs-fixer fix"
+    silent: true
+
+  coding-standards:php:check:
+    desc: "Check coding standards for PHP"
+    cmds:
+      - task: coding-standards:php:apply
+      - "{{.DOCKER_COMPOSE}} run --rm phpfpm vendor/bin/php-cs-fixer fix --dry-run --diff"
+    silent: true
+
+  # JavaScript
+  coding-standards:javascript:apply:
+    desc: "Apply coding standards for JavaScript"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm prettier 'assets/**/*.js' --write"
+
+  coding-standards:javascript:check:
+    desc: "Check coding standards for JavaScript"
+    cmds:
+      - task: coding-standards:javascript:apply
+      - "{{.DOCKER_COMPOSE}} run --rm prettier 'assets/**/*.js' --check"
+
+  # Markdown
+  coding-standards:markdown:apply:
+    desc: "Apply coding standards for Markdown"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm markdownlint markdownlint '**/*.md' --fix"
+
+  coding-standards:markdown:check:
+    desc: "Check coding standards for Markdown"
+    cmds:
+      - task: coding-standards:markdown:apply
+      - "{{.DOCKER_COMPOSE}} run --rm markdownlint markdownlint '**/*.md'"
+
+  # Styles (CSS/SCSS)
+  coding-standards:styles:apply:
+    desc: "Apply coding standards for Styles"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm prettier 'assets/**/*.{css,scss}' --write"
+
+  coding-standards:styles:check:
+    desc: "Check coding standards for Styles"
+    cmds:
+      - task: coding-standards:styles:apply
+      - "{{.DOCKER_COMPOSE}} run --rm prettier 'assets/**/*.{css,scss}' --check"
+
+  # Twig
+  coding-standards:twig:apply:
+    desc: "Apply coding standards for Twig"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm phpfpm vendor/bin/twig-cs-fixer fix"
+    silent: true
+
+  coding-standards:twig:check:
+    desc: "Check coding standards for Twig"
+    cmds:
+      - task: coding-standards:twig:apply
+      - "{{.DOCKER_COMPOSE}} run --rm phpfpm vendor/bin/twig-cs-fixer lint"
+    silent: true
+
+  # YAML
+  coding-standards:yaml:apply:
+    desc: "Apply coding standards for YAML"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm prettier '**/*.{yml,yaml}' --write"
+
+  coding-standards:yaml:check:
+    desc: "Check coding standards for YAML"
+    cmds:
+      - task: coding-standards:yaml:apply
+      - "{{.DOCKER_COMPOSE}} run --rm prettier '**/*.{yml,yaml}' --check"
+
+  # ---------------------------------------------------------------------------
+  # Code Analysis
+  # ---------------------------------------------------------------------------
+
+  analyze:
+    desc: "Run PHPStan analysis"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm phpfpm vendor/bin/phpstan analyse"
+    silent: true
+
+  # ---------------------------------------------------------------------------
+  # Tests
+  # ---------------------------------------------------------------------------
+
+  test:
+    desc: "Run PHPUnit tests"
+    cmds:
+      - "{{.DOCKER_COMPOSE}} run --rm phpfpm vendor/bin/phpunit"
+    silent: true
