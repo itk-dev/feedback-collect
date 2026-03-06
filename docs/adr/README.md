@@ -9,7 +9,7 @@ options considered, and rationale.
 ## Index
 
 | ADR | Title | Status |
-|-----|-------|--------|
+| --- | ----- | ------ |
 | [001](001-database-engine.md) | Database engine: MariaDB | Accepted |
 | [002](002-data-flow-architecture.md) | Data flow: dual posting | Accepted |
 | [003](003-uuidv7-primary-keys.md) | UUIDv7 for primary keys | Accepted |

@@ -25,5 +25,7 @@ and this project adheres to
 
 ### Changed
 
+- Simplified documentation: trimmed README, archived planning specs
+  to `docs/archive/`, added architecture summary to CLAUDE.md
 - Updated backend spec with ITK Dev tooling references, PHP 8.4,
   and ADR cross-references

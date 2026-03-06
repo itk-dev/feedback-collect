@@ -3,6 +3,19 @@
 Centralized feedback collection and triage backend. Aggregates feedback
 from staging sites running the `itk-dev/tidy-feedback` widget.
 
+## Architecture
+
+Two-layer system: **staging sites** run the `itk-dev/tidy-feedback`
+widget with a local SQLite dashboard (testers/PO interface), and
+**this central backend** (Symfony + MariaDB) aggregates feedback from
+all sites into a PM dashboard for triage and GitHub export.
+
+Data flow uses **dual posting** (ADR-002): the widget saves locally
+first, then forwards to the central backend as best-effort. Local
+storage is always guaranteed — no data loss during backend downtime.
+
+Key decisions are documented in [Architecture Decision Records](docs/adr/).
+
 ## Tech Stack
 
 - **Framework:** Symfony 7.x
@@ -39,7 +52,7 @@ task test
 
 ## Key Directories
 
-```
+```text
 docs/           Specification documents and ADRs
 docs/adr/       Architecture Decision Records
 .docker/        Nginx config and Docker data
