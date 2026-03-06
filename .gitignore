@@ -1,0 +1,32 @@
+###> symfony/framework-bundle ###
+/.env.local
+/.env.local.php
+/.env.*.local
+/config/secrets/prod/prod.decrypt.private.php
+/public/bundles/
+/var/
+/vendor/
+###< symfony/framework-bundle ###
+
+###> symfony/asset-mapper ###
+/public/assets/
+###< symfony/asset-mapper ###
+
+###> phpunit/phpunit ###
+/phpunit.xml
+.phpunit.result.cache
+###< phpunit/phpunit ###
+
+###> php-cs-fixer ###
+/.php-cs-fixer.cache
+###< php-cs-fixer ###
+
+# Docker data
+.docker/data/mariadb/
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

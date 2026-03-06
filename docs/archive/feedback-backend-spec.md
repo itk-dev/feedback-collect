@@ -53,7 +53,7 @@ The system consists of two distinct layers:
 
 **Staging site layer** (`itk-dev/tidy-feedback` module/bundle) — Installed on each staging site. Provides the feedback widget for testers and POs, stores submissions in a local SQLite database, and exposes a local dashboard at `/tidy-feedback` for reviewing submissions. This is the primary interface for the people submitting feedback.
 
-**Central backend application** (new Symfony app) — Aggregates feedback from all staging sites, stores it in PostgreSQL, and provides a dashboard for the Product Manager to triage, categorise, and export items to GitHub. This is the PM's domain — not the tester's.
+**Central backend application** (new Symfony app) — Aggregates feedback from all staging sites, stores it in MariaDB, and provides a dashboard for the Product Manager to triage, categorise, and export items to GitHub. This is the PM's domain — not the tester's.
 
 How feedback moves from the staging layer to the central backend is an open architectural decision (see section 2.1).
 
@@ -372,7 +372,7 @@ TIDY_FEEDBACK_CAPTURE_DOCUMENT=false
 | Layer | Technology |
 |-------|-----------|
 | Framework | Symfony 7.x |
-| Database | PostgreSQL (via Doctrine ORM) |
+| Database | MariaDB (via Doctrine ORM) |
 | Templating | Twig |
 | JS interactivity | Stimulus (via `symfony/stimulus-bundle`) |
 | SPA navigation | Turbo Drive + Turbo Frames (`symfony/ux-turbo`) |
@@ -385,14 +385,16 @@ TIDY_FEEDBACK_CAPTURE_DOCUMENT=false
 | Email notifications | Symfony Mailer |
 | External trackers | GitHub API via `knplabs/github-api` (v1), adapter pattern for future trackers |
 | Testing | PHPUnit + Symfony Panther for E2E |
-| Dev tooling | Docker Compose, Taskfile |
+| Dev tooling | itkdev-docker-compose (symfony-6 template), Taskfile.yml |
+| Code quality | PHP CS Fixer (@Symfony), PHPStan, Twig CS Fixer, Prettier, markdownlint |
+| Composer | ergebnis/composer-normalize |
 
 ### 3.6 Configuration
 
 The backend application is configured via environment variables:
 
 ```env
-DATABASE_URL=postgresql://user:pass@localhost:5432/tidy_feedback
+DATABASE_URL=mysql://user:pass@mariadb:3306/tidy_feedback?serverVersion=mariadb-10.11.0
 APP_SECRET=your-app-secret
 SCREENSHOT_STORAGE_PATH=%kernel.project_dir%/var/screenshots
 MAX_PAYLOAD_SIZE=10485760
@@ -425,7 +427,7 @@ The feedback list page supports filtering by project, status, date range, and fr
 - `status` — filter by workflow status
 - `createdAt` — sort by date, date range filter
 - `project_id, status, createdAt` — composite index for the most common query pattern (filtered list sorted by date)
-- GIN index on `subject` and `description` — PostgreSQL full-text search for the search filter
+- FULLTEXT index on `subject` and `description` — for the search filter
 
 #### 3.8.2 Data Retention & Cleanup
 
@@ -655,8 +657,10 @@ The API key will be visible in the page source (embedded in the widget config). 
 
 1. **Project scaffolding**
    - Create new Symfony 7.x project
-   - Configure Docker Compose (PHP 8.3, PostgreSQL, nginx)
-   - Set up Taskfile for common commands
+   - Install ITK Dev Docker template (`itkdev-docker-compose template:install symfony-6`)
+   - Configure `.env` with ITK Dev standard variables (`COMPOSE_PROJECT_NAME`, `COMPOSE_DOMAIN`)
+   - Set up `Taskfile.yml` following ITK Dev patterns (standard variables, coding-standards tasks)
+   - Install dev dependencies: `friendsofphp/php-cs-fixer`, `vincentlanglet/twig-cs-fixer`, `phpstan/phpstan`, `ergebnis/composer-normalize`
    - Configure AssetMapper + Stimulus + Turbo
 
 2. **Data model & migrations**
@@ -794,10 +798,15 @@ The API key will be visible in the page source (embedded in the widget config). 
     - Deployment documentation (Docker / platform.sh / similar)
     - Screenshot cleanup job (Symfony Scheduler or cron) per retention policy (section 3.8.2)
 
-20. **Testing**
+20. **Testing & code quality**
     - Unit tests for API key auth, feedback ingestion, tracker adapters
     - Functional tests for dashboard (WebTestCase)
     - E2E tests with Panther for critical flows
+    - PHP CS Fixer check (`task coding-standards:php:check`)
+    - PHPStan analysis (`task analyze`)
+    - Twig CS Fixer lint (`task coding-standards:twig:check`)
+    - Markdown, YAML, JavaScript, CSS checks via Prettier/markdownlint
+    - Composer validate and normalize (`composer validate --strict`, `composer normalize --dry-run`)
 
 > **Deferred to future phases:**
 > - **Dashboard overview page** — summary statistics per project, sparklines, recent feedback
@@ -810,7 +819,22 @@ The API key will be visible in the page source (embedded in the widget config). 
 ## 6. File Structure (Backend Application)
 
 ```
-tidy-feedback-backend/
+feedback-collect/
+├── .docker/
+│   ├── nginx.conf
+│   ├── templates/
+│   │   └── default.conf.template
+│   └── data/
+├── .github/
+│   └── workflows/
+│       ├── changelog.yaml
+│       ├── composer.yaml
+│       ├── javascript.yaml
+│       ├── markdown.yaml
+│       ├── php.yaml
+│       ├── styles.yaml
+│       ├── twig.yaml
+│       └── yaml.yaml
 ├── assets/
 │   ├── controllers/           # Stimulus controllers
 │   │   ├── clipboard_controller.js
@@ -894,7 +918,27 @@ tidy-feedback-backend/
 │   │       └── _tracker_form.html.twig
 │   └── components/
 │       └── FeedbackTable.html.twig
-├── compose.yaml
+├── docs/
+│   ├── adr/               # Architecture Decision Records
+│   ├── feedback-backend-spec.md
+│   ├── feedback-frontend-spec.md
+│   └── user-stories.md
+├── docker-compose.yml      # ITK Dev symfony-6 template
+├── docker-compose.server.yml
+├── docker-compose.dev.yml
+├── docker-compose.redirect.yml
+├── .editorconfig
+├── .env
+├── .gitignore
+├── .markdownlint.jsonc
+├── .markdownlintignore
+├── .php-cs-fixer.dist.php
+├── .prettierrc.yaml
+├── .twig-cs-fixer.dist.php
+├── CHANGELOG.md
+├── CLAUDE.md
+├── phpstan.dist.neon
+├── README.md
 ├── Taskfile.yml
 └── ...
 ```
@@ -905,17 +949,17 @@ tidy-feedback-backend/
 
 **Symfony (not Drupal) for the backend** — The backend is a focused application (API + dashboard), not a content management system. Symfony gives full control with less overhead. The frontend widget already supports both Drupal and Symfony, so this is consistent.
 
-**Stimulus + Turbo + Live Components (not React)** — Aligns with the team's preference to avoid complex JS frameworks. Symfony UX Live Components handle the most interactive part (filter/table) entirely in PHP + Twig. Stimulus handles small interactive behaviors (clipboard, bulk select, collapsible sections, confirmations). Turbo Drive provides SPA-like navigation with zero JS.
+**Stimulus + Turbo + Live Components (not React)** — Aligns with the team's preference to avoid complex JS frameworks and ITK Dev server-rendered conventions. Symfony UX Live Components handle the most interactive part (filter/table) entirely in PHP + Twig. Stimulus handles small interactive behaviors (clipboard, bulk select, collapsible sections, confirmations). Turbo Drive provides SPA-like navigation with zero JS. See [ADR-006](adr/006-frontend-framework.md).
 
 **Bootstrap 5 for CSS** — Battle-tested and already used in tidy-feedback. Symfony UX Toolkit (Tailwind-based) is promising but still maturing; it can be evaluated for a future redesign.
 
-**PostgreSQL** — Better JSON querying support than MySQL for the `contextData` and `rawData` fields. Strong full-text search capabilities for the search filter.
+**MariaDB** — Standard ITK Dev database engine. Provides `JSON_EXTRACT` for querying structured context data and FULLTEXT indexes for the search filter. Full alignment with the ITK Dev `symfony-6` Docker template. See [ADR-001](adr/001-database-engine.md).
 
-**API key authentication (not OAuth)** — Simple, fits the use case. The widget is a trusted first-party component installed by the site operator, not an arbitrary third-party. API keys keep the integration simple (one header).
+**API key authentication (not OAuth)** — Simple, fits the use case. The widget is a trusted first-party component installed by the site operator, not an arbitrary third-party. API keys keep the integration simple (one header). See [ADR-004](adr/004-authentication-approach.md).
 
-**Screenshots on filesystem (not in database)** — The current widget can generate screenshots of several megabytes. Storing binary data in the database would quickly cause bloat. Flysystem abstraction allows migrating to S3/object storage later without code changes.
+**Screenshots on filesystem (not in database)** — The current widget can generate screenshots of several megabytes. Storing binary data in the database would quickly cause bloat. Flysystem abstraction allows migrating to S3/object storage later without code changes. See [ADR-005](adr/005-screenshot-storage.md).
 
-**UUIDv7 as primary keys** — Sortable by creation time, no sequential ID guessing, safe to expose in URLs.
+**UUIDv7 as primary keys** — Sortable by creation time, no sequential ID guessing, safe to expose in URLs. See [ADR-003](adr/003-uuidv7-primary-keys.md).
 
 **Adapter pattern for issue trackers** — Cleanly separates tracker-specific API logic from the core application. Adding a new tracker is one new class implementing the interface. Starting with GitHub since the team already uses it. Leantime is prioritized next given team usage.
 
